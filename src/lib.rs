@@ -68,12 +68,20 @@ pub fn handle_action(action_id: String, payload: serde_json::Value) {
 // ---------------------------------------------------------------------------
 
 fn run_dotnet_test(session_id: &str, cwd: Option<&str>, extra_args: &[String]) {
-    // Build args: ["test", "--verbosity", "normal", ...extra_args]
-    let mut args: Vec<&str> = vec!["test", "--verbosity", "normal"];
+    // Build args: ["test", "--verbosity", "detailed", ...extra_args]
+    // We use "detailed" (not "normal") so that xUnit v3 / .NET 10 emits individual
+    // per-test result lines.  With "normal", xUnit v3 only prints a summary.
+    let mut args: Vec<&str> = vec!["test", "--verbosity", "detailed"];
     let extra_refs: Vec<&str> = extra_args.iter().map(|s| s.as_str()).collect();
     args.extend(extra_refs.iter());
 
     let project_path = cwd.unwrap_or(".");
+
+    log!(
+        "[dotnet-test] run_dotnet_test: session_id={} cwd={:?}",
+        session_id,
+        cwd
+    );
 
     // Emit testRunStarted
     let started_json = json!({
@@ -82,11 +90,20 @@ fn run_dotnet_test(session_id: &str, cwd: Option<&str>, extra_args: &[String]) {
         "projectPath": project_path
     })
     .to_string();
+    log!("[dotnet-test] emitting testRunStarted: {}", started_json);
     push_raw_event(session_id, &started_json);
 
+    log!(
+        "[dotnet-test] spawning: dotnet test --verbosity normal (cwd={:?})",
+        cwd
+    );
     let child = match ChildProcess::spawn("dotnet", args, cwd, std::collections::HashMap::new()) {
-        Ok(c) => c,
-        Err(_) => {
+        Ok(c) => {
+            log!("[dotnet-test] spawn succeeded");
+            c
+        }
+        Err(e) => {
+            log!("[dotnet-test] spawn FAILED: {:?}", e);
             let err_json = json!({
                 "type": "testRunCompleted",
                 "passed": 0,
@@ -105,6 +122,7 @@ fn run_dotnet_test(session_id: &str, cwd: Option<&str>, extra_args: &[String]) {
     let mut stderr_buf: Vec<u8> = Vec::new();
     let mut parser = DotnetTestParser::new();
     let start_ms = now_ms();
+    let mut loop_iters: u32 = 0;
 
     // Single streaming loop.  We exit when any of these is true:
     //   1. ReadResult::EOF  — pipe closed cleanly (no MSBuild workers)
@@ -118,6 +136,17 @@ fn run_dotnet_test(session_id: &str, cwd: Option<&str>, extra_args: &[String]) {
     //     for its workers before exiting, so it can stay "Running" for seconds
     //     after all output has been printed
     loop {
+        loop_iters += 1;
+        if loop_iters % 10 == 1 {
+            log!(
+                "[dotnet-test] read loop iter={} run_complete={} parsed(p={} f={} s={})",
+                loop_iters,
+                parser.run_complete,
+                parser.passed,
+                parser.failed,
+                parser.skipped
+            );
+        }
         child.wait_for_data(200);
 
         // Drain stderr — also check for "Test Run Failed/Successful." which
@@ -129,8 +158,8 @@ fn run_dotnet_test(session_id: &str, cwd: Option<&str>, extra_args: &[String]) {
                     // Scan newly received stderr bytes for the run-complete signal.
                     let text = String::from_utf8_lossy(&data);
                     for line in text.lines() {
-                        let t = line.trim();
-                        if t.starts_with("Test Run Successful") || t.starts_with("Test Run Failed")
+                        let t = line.trim().to_lowercase();
+                        if t.starts_with("test run successful") || t.starts_with("test run failed")
                         {
                             parser.run_complete = true;
                         }
@@ -157,6 +186,12 @@ fn run_dotnet_test(session_id: &str, cwd: Option<&str>, extra_args: &[String]) {
         }
 
         if got_eof || parser.run_complete {
+            log!(
+                "[dotnet-test] exiting read loop: got_eof={} run_complete={} iters={}",
+                got_eof,
+                parser.run_complete,
+                loop_iters
+            );
             break;
         }
 
@@ -164,7 +199,14 @@ fn run_dotnet_test(session_id: &str, cwd: Option<&str>, extra_args: &[String]) {
         // where the summary line is never printed, e.g. build errors).
         match child.get_status() {
             ProcessStatus::Running => {}
-            _ => break,
+            s => {
+                log!(
+                    "[dotnet-test] process exited (status={:?}), breaking read loop after {} iters",
+                    s,
+                    loop_iters
+                );
+                break;
+            }
         }
     }
 
@@ -192,6 +234,13 @@ fn run_dotnet_test(session_id: &str, cwd: Option<&str>, extra_args: &[String]) {
         push_raw_event(session_id, &event_json);
     }
     let elapsed_secs = (now_ms() - start_ms) as f64 / 1000.0;
+    log!(
+        "[dotnet-test] run finished: passed={} failed={} skipped={} elapsed={:.3}s",
+        parser.passed,
+        parser.failed,
+        parser.skipped,
+        elapsed_secs
+    );
     emit_completed(&parser, elapsed_secs, session_id);
 
     let _ = stderr_buf;
@@ -204,8 +253,20 @@ fn process_lines(buf: &mut Vec<u8>, parser: &mut DotnetTestParser, session_id: &
         if let Some(nl) = buf.iter().position(|&b| b == b'\n') {
             let line_bytes: Vec<u8> = buf.drain(..=nl).collect();
             let line = String::from_utf8_lossy(&line_bytes).to_string();
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                log!("[dotnet-test] stdout: {}", trimmed);
+            }
             push_log_event(session_id, &line);
-            for event_json in parser.feed_line(&line) {
+            let events = parser.feed_line(&line);
+            if !events.is_empty() {
+                log!(
+                    "[dotnet-test] parser produced {} event(s) for line: {}",
+                    events.len(),
+                    trimmed
+                );
+            }
+            for event_json in events {
                 push_raw_event(session_id, &event_json);
             }
         } else {
@@ -258,6 +319,11 @@ fn emit_completed(parser: &DotnetTestParser, elapsed_secs: f64, session_id: &str
 // ---------------------------------------------------------------------------
 
 fn push_raw_event(session_id: &str, json: &str) {
+    log!(
+        "[dotnet-test] push_raw_event session={} json={}",
+        session_id,
+        json
+    );
     unsafe {
         chorograph_plugin_sdk_rust::ffi::host_push_ai_event(
             session_id.as_ptr(),
@@ -406,13 +472,24 @@ impl DotnetTestParser {
 
     fn parse_line(&mut self, line: &str) -> Option<String> {
         let trimmed = line.trim();
+        // Normalise to lowercase for prefix matching so we handle both
+        // xUnit v2 ("Passed  Ns.Class.Method") and xUnit v3 ("passed Ns.Class.Method").
+        let lower = trimmed.to_lowercase();
+
+        // Helper: strip a prefix (lowercase match) and return the remainder
+        // from the *original* trimmed string (preserving casing of the identifier).
+        fn strip_ci<'a>(trimmed: &'a str, lower: &str, prefix: &str) -> Option<&'a str> {
+            if lower.starts_with(prefix) {
+                Some(trimmed[prefix.len()..].trim_start())
+            } else {
+                None
+            }
+        }
 
         // ── xUnit / MSTest individual test result lines ─────────────────
-        if let Some(rest) = trimmed
-            .strip_prefix("Passed ")
-            .or_else(|| trimmed.strip_prefix("Passed  "))
+        if let Some(rest) =
+            strip_ci(trimmed, &lower, "passed  ").or_else(|| strip_ci(trimmed, &lower, "passed "))
         {
-            let rest = rest.trim_start();
             if !looks_like_test_identifier(rest) {
                 return None;
             }
@@ -421,11 +498,9 @@ impl DotnetTestParser {
             return Some(make_test_event("passed", &class, &name, dur, None));
         }
 
-        if let Some(rest) = trimmed
-            .strip_prefix("Failed ")
-            .or_else(|| trimmed.strip_prefix("Failed  "))
+        if let Some(rest) =
+            strip_ci(trimmed, &lower, "failed  ").or_else(|| strip_ci(trimmed, &lower, "failed "))
         {
-            let rest = rest.trim_start();
             if !looks_like_test_identifier(rest) {
                 return None;
             }
@@ -442,11 +517,9 @@ impl DotnetTestParser {
             return None; // wait for message lines
         }
 
-        if let Some(rest) = trimmed
-            .strip_prefix("Skipped ")
-            .or_else(|| trimmed.strip_prefix("Skipped  "))
+        if let Some(rest) =
+            strip_ci(trimmed, &lower, "skipped  ").or_else(|| strip_ci(trimmed, &lower, "skipped "))
         {
-            let rest = rest.trim_start();
             if !looks_like_test_identifier(rest) {
                 return None;
             }
@@ -457,7 +530,13 @@ impl DotnetTestParser {
 
         // ── Error message block (inside a Failed block) ──────────────────
         if let Some(ref mut pf) = self.current_failure {
-            if trimmed == "Error Message:" || trimmed == "Standard Output Messages:" {
+            // xUnit v2: "Error Message:" / "Standard Output Messages:"
+            // xUnit v3: "[FAIL]" marker
+            let lower_trim = trimmed.to_lowercase();
+            if trimmed == "Error Message:"
+                || trimmed == "Standard Output Messages:"
+                || lower_trim == "[fail]"
+            {
                 pf.in_error_block = true;
                 return None;
             }
@@ -468,22 +547,27 @@ impl DotnetTestParser {
                 }
                 return None;
             }
-            if trimmed.starts_with("Stack Trace:") || trimmed.starts_with("at ") {
+            // End of error block: stack trace markers or xUnit v3 output markers
+            if trimmed.starts_with("Stack Trace:")
+                || trimmed.starts_with("at ")
+                || trimmed.starts_with("[STACK]")
+                || trimmed.starts_with("[OUTPUT]")
+            {
                 pf.in_error_block = false;
                 return None;
             }
         }
 
         // ── Summary line: "Failed: N, Passed: N, Skipped: N, ..." ────────
-        if trimmed.contains("Failed:") && trimmed.contains("Passed:") {
+        if lower.contains("failed:") && lower.contains("passed:") {
             // Parse the summary counts — these are authoritative.
             // Note: individual Passed/Failed/Skipped increments above may be
             // off if the verbosity level doesn't print all test results; the
             // summary overrides.
             if let (Some(p), Some(f), Some(s)) = (
-                extract_count(trimmed, "Passed:"),
-                extract_count(trimmed, "Failed:"),
-                extract_count(trimmed, "Skipped:"),
+                extract_count(&lower, "passed:"),
+                extract_count(&lower, "failed:"),
+                extract_count(&lower, "skipped:"),
             ) {
                 self.passed = p;
                 self.failed = f;
@@ -494,7 +578,7 @@ impl DotnetTestParser {
         }
 
         // ── "Test Run Successful." / "Test Run Failed." ───────────────────
-        if trimmed.starts_with("Test Run Successful") || trimmed.starts_with("Test Run Failed") {
+        if lower.starts_with("test run successful") || lower.starts_with("test run failed") {
             self.run_complete = true;
             return None;
         }
@@ -502,15 +586,15 @@ impl DotnetTestParser {
         // ── xUnit separate-line summary: "     Passed: 74" / "     Failed: 1" ──
         // These appear after "Test Run Failed/Successful." and carry authoritative counts.
         if self.run_complete {
-            if let Some(rest) = trimmed.strip_prefix("Passed:") {
+            if let Some(rest) = lower.strip_prefix("passed:") {
                 if let Ok(n) = rest.trim().parse::<u32>() {
                     self.passed = n;
                 }
-            } else if let Some(rest) = trimmed.strip_prefix("Failed:") {
+            } else if let Some(rest) = lower.strip_prefix("failed:") {
                 if let Ok(n) = rest.trim().parse::<u32>() {
                     self.failed = n;
                 }
-            } else if let Some(rest) = trimmed.strip_prefix("Skipped:") {
+            } else if let Some(rest) = lower.strip_prefix("skipped:") {
                 if let Ok(n) = rest.trim().parse::<u32>() {
                     self.skipped = n;
                 }
@@ -528,12 +612,26 @@ impl DotnetTestParser {
 
 fn is_result_line(line: &str) -> bool {
     let t = line.trim();
-    let is_passed = (t.starts_with("Passed ") || t.starts_with("Passed  "))
-        && looks_like_test_identifier(t.trim_start_matches("Passed").trim_start());
-    let is_failed = (t.starts_with("Failed ") || t.starts_with("Failed  "))
-        && looks_like_test_identifier(t.trim_start_matches("Failed").trim_start());
-    let is_skipped = (t.starts_with("Skipped ") || t.starts_with("Skipped  "))
-        && looks_like_test_identifier(t.trim_start_matches("Skipped").trim_start());
+    let lower = t.to_lowercase();
+    fn rest_after_first_space<'a>(t: &'a str, lower: &str, prefix: &str) -> Option<&'a str> {
+        if lower.starts_with(prefix) {
+            Some(t[prefix.len()..].trim_start())
+        } else {
+            None
+        }
+    }
+    let is_passed = rest_after_first_space(t, &lower, "passed  ")
+        .or_else(|| rest_after_first_space(t, &lower, "passed "))
+        .map(|r| looks_like_test_identifier(r))
+        .unwrap_or(false);
+    let is_failed = rest_after_first_space(t, &lower, "failed  ")
+        .or_else(|| rest_after_first_space(t, &lower, "failed "))
+        .map(|r| looks_like_test_identifier(r))
+        .unwrap_or(false);
+    let is_skipped = rest_after_first_space(t, &lower, "skipped  ")
+        .or_else(|| rest_after_first_space(t, &lower, "skipped "))
+        .map(|r| looks_like_test_identifier(r))
+        .unwrap_or(false);
     is_passed || is_failed || is_skipped
 }
 
@@ -548,8 +646,8 @@ fn looks_like_test_identifier(s: &str) -> bool {
 }
 
 fn is_summary_line(line: &str) -> bool {
-    let t = line.trim();
-    t.starts_with("Test Run ") || (t.contains("Failed:") && t.contains("Passed:"))
+    let t = line.trim().to_lowercase();
+    t.starts_with("test run ") || (t.contains("failed:") && t.contains("passed:"))
 }
 
 /// Split "Ns.Class.Method [12 ms]" into (class, method, duration_secs).
